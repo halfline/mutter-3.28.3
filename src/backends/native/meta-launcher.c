@@ -46,6 +46,8 @@
 #include "meta-cursor-renderer-native.h"
 #include "meta-renderer-native.h"
 
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(GUdevClient, g_object_unref)
+
 struct _MetaLauncher
 {
   Login1Session *session_proxy;

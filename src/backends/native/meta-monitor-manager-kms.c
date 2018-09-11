@@ -52,6 +52,9 @@
 
 #define DRM_CARD_UDEV_DEVICE_TYPE "drm_minor"
 
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(GUdevDevice, g_object_unref)
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(GUdevEnumerator, g_object_unref)
+
 typedef struct
 {
   GSource source;
