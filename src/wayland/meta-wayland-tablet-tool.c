@@ -41,7 +41,7 @@
 
 #ifdef HAVE_NATIVE_BACKEND
 #include "backends/native/meta-backend-native.h"
-#include <linux/input-event-codes.h>
+#include <clutter/evdev/linux/input-event-codes.h>
 #endif
 
 #define TABLET_AXIS_MAX 65535

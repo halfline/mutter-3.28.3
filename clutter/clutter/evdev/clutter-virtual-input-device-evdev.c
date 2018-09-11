@@ -33,6 +33,7 @@
 #include "evdev/clutter-input-device-evdev.h"
 #include "evdev/clutter-seat-evdev.h"
 #include "evdev/clutter-virtual-input-device-evdev.h"
+#include "evdev/linux/input-event-codes.h"
 
 enum
 {

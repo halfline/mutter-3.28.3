@@ -24,7 +24,7 @@
 #include "config.h"
 
 #include <clutter/evdev/clutter-evdev.h>
-#include <linux/input-event-codes.h>
+#include <clutter/evdev/linux/input-event-codes.h>
 #include <libinput.h>
 
 #include "meta-backend-native.h"
