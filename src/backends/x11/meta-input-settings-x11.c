@@ -35,6 +35,9 @@
 #ifdef HAVE_LIBGUDEV
 #include <gudev/gudev.h>
 #endif
+#ifdef __linux
+#include <sys/prctl.h>
+#endif
 
 #include <meta/errors.h>
 #include "backends/meta-logical-monitor.h"
@@ -44,6 +47,8 @@ typedef struct _MetaInputSettingsX11Private
 #ifdef HAVE_LIBGUDEV
   GUdevClient *udev_client;
 #endif
+  gboolean syndaemon_spawned;
+  GPid syndaemon_pid;
 } MetaInputSettingsX11Private;
 
 G_DEFINE_TYPE_WITH_PRIVATE (MetaInputSettingsX11, meta_input_settings_x11,
@@ -174,34 +179,34 @@ is_device_synaptics (ClutterInputDevice *device)
   return TRUE;
 }
 
+static gboolean
+is_device_libinput (ClutterInputDevice *device)
+{
+  guchar *has_setting;
+
+  /* We just need looking for a synaptics-specific property */
+  has_setting = get_property (device, "libinput Send Events Modes Available", XA_INTEGER, 8, 2);
+  if (!has_setting)
+    return FALSE;
+
+  meta_XFree (has_setting);
+  return TRUE;
+}
+
 static void
-change_synaptics_tap_left_handed (ClutterInputDevice *device,
-                                  gboolean            tap_enabled,
-                                  gboolean            left_handed)
+change_x_device_left_handed (ClutterInputDevice *device,
+                             gboolean            left_handed)
 {
   MetaDisplay *display = meta_get_display ();
   MetaBackend *backend = meta_get_backend ();
   Display *xdisplay = meta_backend_x11_get_xdisplay (META_BACKEND_X11 (backend));
   XDevice *xdevice;
-  guchar *tap_action, *buttons;
+  guchar *buttons;
   guint buttons_capacity = 16, n_buttons;
 
   xdevice = device_ensure_xdevice (device);
   if (!xdevice)
     return;
-
-  tap_action = get_property (device, "Synaptics Tap Action",
-                             XA_INTEGER, 8, 7);
-  if (!tap_action)
-    return;
-
-  tap_action[4] = tap_enabled ? (left_handed ? 3 : 1) : 0;
-  tap_action[5] = tap_enabled ? (left_handed ? 1 : 3) : 0;
-  tap_action[6] = tap_enabled ? 2 : 0;
-
-  change_property (device, "Synaptics Tap Action",
-                   XA_INTEGER, 8, tap_action, 7);
-  meta_XFree (tap_action);
 
   if (display)
     meta_error_trap_push (display);
@@ -222,17 +227,41 @@ change_synaptics_tap_left_handed (ClutterInputDevice *device,
   buttons[0] = left_handed ? 3 : 1;
   buttons[2] = left_handed ? 1 : 3;
   XSetDeviceButtonMapping (xdisplay, xdevice, buttons, n_buttons);
+  g_free (buttons);
 
   if (display && meta_error_trap_pop_with_return (display))
     {
-      g_warning ("Could not set synaptics touchpad left-handed for %s",
+      g_warning ("Could not set left-handed for %s",
                  clutter_input_device_get_device_name (device));
     }
 }
 
 static void
-change_synaptics_speed (ClutterInputDevice *device,
-                        gdouble             speed)
+change_synaptics_tap_left_handed (ClutterInputDevice *device,
+                                  gboolean            tap_enabled,
+                                  gboolean            left_handed)
+{
+  guchar *tap_action;
+
+  tap_action = get_property (device, "Synaptics Tap Action",
+                             XA_INTEGER, 8, 7);
+  if (!tap_action)
+    return;
+
+  tap_action[4] = tap_enabled ? (left_handed ? 3 : 1) : 0;
+  tap_action[5] = tap_enabled ? (left_handed ? 1 : 3) : 0;
+  tap_action[6] = tap_enabled ? 2 : 0;
+
+  change_property (device, "Synaptics Tap Action",
+                   XA_INTEGER, 8, tap_action, 7);
+  meta_XFree (tap_action);
+
+  change_x_device_left_handed (device, left_handed);
+}
+
+static void
+change_x_device_speed (ClutterInputDevice *device,
+                       gdouble             speed)
 {
   MetaDisplay *display = meta_get_display ();
   MetaBackend *backend = meta_get_backend ();
@@ -328,6 +357,124 @@ change_synaptics_speed (ClutterInputDevice *device,
 }
 
 static void
+change_x_device_scroll_button (ClutterInputDevice *device,
+                               guint               button)
+{
+  guchar value;
+
+  value = button > 0 ? 1 : 0;
+  change_property (device, "Evdev Wheel Emulation",
+                   XA_INTEGER, 8, &value, 1);
+  if (button > 0)
+    {
+      value = button;
+      change_property (device, "Evdev Wheel Emulation Button",
+                       XA_INTEGER, 8, &value, 1);
+    }
+}
+
+/* Ensure that syndaemon dies together with us, to avoid running several of
+ * them */
+static void
+setup_syndaemon (gpointer user_data)
+{
+#ifdef __linux
+  prctl (PR_SET_PDEATHSIG, SIGHUP);
+#endif
+}
+
+static gboolean
+have_program_in_path (const char *name)
+{
+  gchar *path;
+  gboolean result;
+
+  path = g_find_program_in_path (name);
+  result = (path != NULL);
+  g_free (path);
+  return result;
+}
+
+static void
+syndaemon_died (GPid     pid,
+                gint     status,
+                gpointer user_data)
+{
+  MetaInputSettingsX11 *settings_x11 = META_INPUT_SETTINGS_X11 (user_data);
+  MetaInputSettingsX11Private *priv =
+    meta_input_settings_x11_get_instance_private (settings_x11);
+  GError *error = NULL;
+
+  if (!g_spawn_check_exit_status (status, &error))
+    {
+      if ((WIFSIGNALED (status) && WTERMSIG (status) != SIGHUP) ||
+          error->domain == G_SPAWN_EXIT_ERROR)
+        g_warning ("Syndaemon exited unexpectedly: %s", error->message);
+      g_error_free (error);
+    }
+
+  g_spawn_close_pid (pid);
+  priv->syndaemon_spawned = FALSE;
+}
+
+static void
+set_synaptics_disable_w_typing (MetaInputSettings *settings,
+                                gboolean           state)
+{
+  MetaInputSettingsX11 *settings_x11 = META_INPUT_SETTINGS_X11 (settings);
+  MetaInputSettingsX11Private *priv =
+    meta_input_settings_x11_get_instance_private (settings_x11);
+
+  if (state)
+    {
+      GError *error = NULL;
+      GPtrArray *args;
+
+      if (priv->syndaemon_spawned)
+        return;
+
+      if (!have_program_in_path ("syndaemon"))
+        return;
+
+      args = g_ptr_array_new ();
+
+      g_ptr_array_add (args, "syndaemon");
+      g_ptr_array_add (args, "-i");
+      g_ptr_array_add (args, "1.0");
+      g_ptr_array_add (args, "-t");
+      g_ptr_array_add (args, "-K");
+      g_ptr_array_add (args, "-R");
+      g_ptr_array_add (args, NULL);
+
+      /* we must use G_SPAWN_DO_NOT_REAP_CHILD to avoid
+       * double-forking, otherwise syndaemon will immediately get
+       * killed again through (PR_SET_PDEATHSIG when the intermediate
+       * process dies */
+      g_spawn_async (g_get_home_dir (), (char **) args->pdata, NULL,
+                     G_SPAWN_SEARCH_PATH|G_SPAWN_DO_NOT_REAP_CHILD, setup_syndaemon, NULL,
+                     &priv->syndaemon_pid, &error);
+
+      priv->syndaemon_spawned = (error == NULL);
+      g_ptr_array_free (args, TRUE);
+
+      if (error)
+        {
+          g_warning ("Failed to launch syndaemon: %s", error->message);
+          g_error_free (error);
+        }
+      else
+        {
+          g_child_watch_add (priv->syndaemon_pid, syndaemon_died, settings);
+        }
+    }
+  else if (priv->syndaemon_spawned)
+    {
+      kill (priv->syndaemon_pid, SIGHUP);
+      priv->syndaemon_spawned = FALSE;
+    }
+}
+
+static void
 meta_input_settings_x11_set_send_events (MetaInputSettings        *settings,
                                          ClutterInputDevice       *device,
                                          GDesktopDeviceSendEvents  mode)
@@ -394,9 +541,10 @@ meta_input_settings_x11_set_speed (MetaInputSettings  *settings,
   Display *xdisplay = meta_backend_x11_get_xdisplay (META_BACKEND_X11 (backend));
   gfloat value = speed;
 
-  if (is_device_synaptics (device))
+  if (is_device_synaptics (device) ||
+      !is_device_libinput (device))
     {
-      change_synaptics_speed (device, speed);
+      change_x_device_speed (device, speed);
       return;
     }
 
@@ -438,6 +586,11 @@ meta_input_settings_x11_set_left_handed (MetaInputSettings  *settings,
           g_object_unref (settings);
           return;
         }
+      else if (!is_device_libinput (device))
+        {
+          change_x_device_left_handed (device, enabled);
+          return;
+        }
 
       change_property (device, "libinput Left Handed Enabled",
                        XA_INTEGER, 8, &value, 1);
@@ -450,6 +603,12 @@ meta_input_settings_x11_set_disable_while_typing (MetaInputSettings  *settings,
                                                   gboolean            enabled)
 {
   guchar value = (enabled) ? 1 : 0;
+
+  if (is_device_synaptics (device))
+    {
+      set_synaptics_disable_w_typing (settings, enabled);
+      return;
+    }
 
   change_property (device, "libinput Disable While Typing Enabled",
                    XA_INTEGER, 8, &value, 1);
@@ -620,6 +779,17 @@ meta_input_settings_x11_has_two_finger_scroll (MetaInputSettings  *settings,
   guchar *available = NULL;
   gboolean has_two_finger = TRUE;
 
+  if (is_device_synaptics (device))
+    {
+      available = get_property (device, "Synaptics Capabilities",
+                                XA_INTEGER, 8, 4);
+      if (!available || !available[3])
+          has_two_finger = FALSE;
+
+      meta_XFree (available);
+      return has_two_finger;
+    }
+
   available = get_property (device, "libinput Scroll Methods Available",
                             XA_INTEGER, 8, SCROLL_METHOD_NUM_FIELDS);
   if (!available || !available[SCROLL_METHOD_FIELD_2FG])
@@ -634,6 +804,12 @@ meta_input_settings_x11_set_scroll_button (MetaInputSettings  *settings,
                                            ClutterInputDevice *device,
                                            guint               button)
 {
+  if (!is_device_libinput (device))
+    {
+      change_x_device_scroll_button (device, button);
+      return;
+    }
+
   change_property (device, "libinput Button Scrolling Button",
                    XA_INTEGER, 32, &button, 1);
 }
