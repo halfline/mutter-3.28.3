@@ -40,6 +40,7 @@ struct _MetaMonitorConfigManager
   MetaMonitorConfigStore *config_store;
 
   MetaMonitorsConfig *current_config;
+  MetaMonitorsConfig *initial_config;
   GQueue config_history;
 };
 
@@ -579,15 +580,30 @@ create_logical_monitor_config_from_output (MetaMonitorManager           *monitor
 }
 
 MetaMonitorsConfig *
-meta_monitor_config_manager_create_current (MetaMonitorConfigManager *config_manager)
+meta_monitor_config_manager_create_initial (MetaMonitorConfigManager *config_manager)
 {
   MetaMonitorManager *monitor_manager = config_manager->monitor_manager;
+  MetaMonitorsConfig *initial_config;
   GList *logical_monitor_configs;
   MetaMonitor *primary_monitor;
   MetaLogicalMonitorLayoutMode layout_mode;
   MetaLogicalMonitorConfig *primary_logical_monitor_config;
   GList *monitors;
   GList *l;
+
+  if (monitor_manager->initial_config != NULL)
+    {
+      gsize num_initial_monitors;
+      gsize num_current_monitors;
+
+      num_initial_monitors = g_list_length (monitor_manager->initial_config->logical_monitor_configs);
+      num_current_monitors = meta_monitor_manager_get_num_logical_monitors (monitor_manager);
+
+      if (num_current_monitors != num_initial_monitors)
+        return NULL;
+
+      return g_object_ref (monitor_manager->initial_config);
+    }
 
   if (meta_monitor_config_store_get_config_count (config_manager->config_store) > 0)
     return NULL;
@@ -630,10 +646,14 @@ meta_monitor_config_manager_create_current (MetaMonitorConfigManager *config_man
                                                logical_monitor_config);
     }
 
-  return meta_monitors_config_new (monitor_manager,
-                                   logical_monitor_configs,
-                                   layout_mode,
-                                   META_MONITORS_CONFIG_FLAG_NONE);
+  initial_config = meta_monitors_config_new (monitor_manager,
+                                             logical_monitor_configs,
+                                             layout_mode,
+                                             META_MONITORS_CONFIG_FLAG_NONE);
+
+  monitor_manager->initial_config = g_object_ref (initial_config);
+
+  return initial_config;
 }
 
 MetaMonitorsConfig *
@@ -1162,6 +1182,7 @@ meta_monitor_config_manager_dispose (GObject *object)
     META_MONITOR_CONFIG_MANAGER (object);
 
   g_clear_object (&config_manager->current_config);
+  g_clear_object (&config_manager->initial_config);
   meta_monitor_config_manager_clear_history (config_manager);
 
   G_OBJECT_CLASS (meta_monitor_config_manager_parent_class)->dispose (object);

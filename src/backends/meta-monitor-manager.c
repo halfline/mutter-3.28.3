@@ -496,6 +496,7 @@ should_use_stored_config (MetaMonitorManager *manager)
 MetaMonitorsConfig *
 meta_monitor_manager_ensure_configured (MetaMonitorManager *manager)
 {
+  g_autoptr (MetaMonitorsConfig) initial_config = NULL;
   MetaMonitorsConfig *config = NULL;
   GError *error = NULL;
   gboolean use_stored_config;
@@ -508,6 +509,8 @@ meta_monitor_manager_ensure_configured (MetaMonitorManager *manager)
     method = META_MONITORS_CONFIG_METHOD_PERSISTENT;
   else
     method = META_MONITORS_CONFIG_METHOD_TEMPORARY;
+
+  initial_config = meta_monitor_config_manager_create_initial (manager->config_manager);
 
   if (use_stored_config)
     {
@@ -576,7 +579,7 @@ meta_monitor_manager_ensure_configured (MetaMonitorManager *manager)
       g_clear_object (&config);
     }
 
-  config = meta_monitor_config_manager_create_current (manager->config_manager);
+  config = g_steal_pointer (&initial_config);
   if (config)
     {
       if (!meta_monitor_manager_apply_monitors_config (manager,
